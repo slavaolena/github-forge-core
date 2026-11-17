@@ -10,6 +10,7 @@ function pkt(s: string | Buffer): Buffer {
   return Buffer.concat([Buffer.from((b.length + 4).toString(16).padStart(4, '0')), b]);
 }
 const flush = () => Buffer.from('0000');
+function sideband(data:Buffer):Buffer{const chunks:Buffer[]=[];for(let i=0;i<data.length;i+=65515)chunks.push(pkt(Buffer.concat([Buffer.from([1]),data.subarray(i,i+65515)])));return Buffer.concat(chunks);}
 function parsePkts(b: Buffer): Buffer[] {
   const out: Buffer[] = []; let i = 0;
   while (i + 4 <= b.length) { const n = parseInt(b.subarray(i, i + 4).toString(), 16); i += 4; if (!n) break; if (n === 1 || n === 2) continue; if (n < 4 || i + n - 4 > b.length) break; out.push(b.subarray(i, i + n - 4)); i += n - 4; }
@@ -20,7 +21,7 @@ function encodeSize(n: number): Buffer { const a: number[] = []; do { let x = n 
 function packEntry(type: string, data: Buffer): Buffer {
   const ids: Record<string, number> = { commit: 1, tree: 2, blob: 3, tag: 4 };
   let n = data.length, first = ((ids[type] ?? 3) << 4) | (n & 15); n = Math.floor(n / 16);
-  const h = [first]; while (n) { let x = n & 127; n = Math.floor(n / 128); if (n) x |= 128; h.push(x); }
+  const h = [first | (n ? 128 : 0)]; while (n) { let x = n & 127; n = Math.floor(n / 128); if (n) x |= 128; h.push(x); }
   return Buffer.concat([Buffer.from(h), deflateSync(data)]);
 }
 function pack(objects: GitObject[]): Buffer {
@@ -99,17 +100,19 @@ export function handleGit(store: GitStore, req: IncomingMessage, res: ServerResp
       if (command === 'command=ls-refs') {
         const prefix = lines.filter(x => x.startsWith('ref-prefix ')).map(x => x.slice(11)); const sym = lines.some(x => x === 'symrefs');
         const listed: Buffer[] = [];
+        const head = store.refs.get(`refs/heads/${store.defaultBranch}`);
+        if (head && (!prefix.length || prefix.some(p => 'HEAD'.startsWith(p)))) listed.push(pkt(`${head} HEAD${sym ? ` symref-target:refs/heads/${store.defaultBranch}` : ''}\n`));
         for (const [name, sha] of refs) if (!prefix.length || prefix.some(p => name.startsWith(p))) listed.push(pkt(`${sha} ${name}${sym && name === `refs/heads/${store.defaultBranch}` ? ` symref-target:HEAD` : ''}\n`));
         listed.push(flush()); respond(200, 'application/x-git-upload-pack-result', Buffer.concat(listed)); return;
       }
       const wants = lines.filter(x => x.startsWith('want ')).map(x => x.slice(5));
       const objs = collect(store, wants, lines); const packData = pack(objs);
-      respond(200, 'application/x-git-upload-pack-result', Buffer.concat([pkt('acknowledgments\n'), pkt('NAK\n'), flush(), pkt('shallow-info\n'), flush(), pkt('packfile\n'), pkt(Buffer.concat([Buffer.from([1]), packData])), flush()])); return;
+      respond(200, 'application/x-git-upload-pack-result', Buffer.concat([pkt('acknowledgments\n'), pkt('NAK\n'), flush(), pkt('shallow-info\n'), flush(), pkt('packfile\n'), sideband(packData), flush()])); return;
     }
     const wants = lines.filter(x => x.startsWith('want ')).map(x => x.slice(5));
     if (!wants.length) { respond(200, 'application/x-git-upload-pack-result', flush()); return; }
     const objs = collect(store, wants, lines), p = pack(objs);
-    respond(200, 'application/x-git-upload-pack-result', Buffer.concat([pkt(Buffer.concat([Buffer.from([1]), p])), flush()])); return;
+    respond(200, 'application/x-git-upload-pack-result', Buffer.concat([sideband(p), flush()])); return;
   }
   if (url.pathname.endsWith('/git-receive-pack') && req.method === 'POST') {
     const packets = parsePkts(body); const commands: Array<{ old: string; next: string; ref: string }> = []; let packOffset = 0;
